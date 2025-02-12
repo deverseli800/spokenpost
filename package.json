@@ -4,10 +4,15 @@
   "scripts": {
     "dev": "turbo run dev",
     "build": "turbo run build",
-    "lint": "turbo run lint"
+    "lint": "turbo run lint",
+    "mix": "repomix"
   },
   "devDependencies": {
-    "turbo": "^1.13.4",
-    "typescript": "^5.3.3"
-  }
+    "turbo": "^1.12.0",
+    "typescript": "^5.3.3",
+    "repomix": "^0.2.26"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
 }
