@@ -1,6 +1,7 @@
 // src/popup/Popup.tsx
 import React, { useEffect, useState } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import { cleanHtml } from './utils/cleanHtml';
 import {
     Title,
     Text,
@@ -11,13 +12,21 @@ import {
     Paper,
     Container,
     Group,
+    Progress,
 } from '@mantine/core';
-import { IconAlertCircle, IconHeadphones } from '@tabler/icons-react';
+import { notifications } from '@mantine/notifications';
+import { IconAlertCircle, IconHeadphones, IconArticle } from '@tabler/icons-react';
 
 const supabase = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
+
+interface ArticleContent {
+    title: string;
+    author?: string | null;
+    content: string;
+}
 
 type PopupState = {
     loading: boolean;
@@ -25,6 +34,71 @@ type PopupState = {
     audioUrl: string | null;
     convertStatus: 'idle' | 'converting' | 'done' | 'error';
     error: string | null;
+    progress: number;
+};
+
+const getArticleContent = async (tab: chrome.tabs.Tab): Promise<ArticleContent> => {
+    const response = await chrome.scripting.executeScript({
+        target: { tabId: tab.id! },
+        func: () => {
+            // First try to use Mozilla's Readability library if available
+            if (typeof window.Readability !== 'undefined') {
+                const documentClone = document.cloneNode(true) as Document;
+                const reader = new window.Readability(documentClone);
+                const article = reader.parse();
+                return article ? {
+                    content: article.content,
+                    title: article.title,
+                    author: article.byline
+                } : null;
+            }
+
+            // Fallback to basic HTML extraction
+            const article = {
+                title: document.querySelector('h1')?.innerText || document.title,
+                author: document.querySelector('[rel="author"], .author, .byline')?.textContent?.trim(),
+                content: ''
+            };
+
+            // Get main content area - adjust selectors based on common article patterns
+            const mainContent = document.querySelector('article, [role="main"], main, .post-content, .article-content');
+            if (mainContent) {
+                // Clone to avoid modifying the actual page
+                const contentClone = mainContent.cloneNode(true) as HTMLElement;
+
+                // Remove unwanted elements
+                const unwanted = contentClone.querySelectorAll(
+                    'script, style, iframe, nav, footer, .ad, .social-share, .related-articles'
+                );
+                unwanted.forEach(el => el.remove());
+
+                // Convert specific elements to text with markers
+                const headings = contentClone.querySelectorAll('h1, h2, h3, h4, h5, h6');
+                headings.forEach(h => {
+                    const level = h.tagName[1];
+                    h.textContent = `[h${level}]${h.textContent}[/h${level}]`;
+                });
+
+                const lists = contentClone.querySelectorAll('ul, ol');
+                lists.forEach(list => {
+                    const items = Array.from(list.querySelectorAll('li'))
+                        .map(li => `• ${li.textContent}`)
+                        .join('\n');
+                    list.outerHTML = `\n${items}\n`;
+                });
+
+                article.content = contentClone.innerHTML;
+            }
+
+            return article;
+        }
+    });
+
+    if (!response[0].result) {
+        throw new Error('Failed to extract article content');
+    }
+
+    return response[0].result;
 };
 
 export function Popup() {
@@ -34,10 +108,11 @@ export function Popup() {
         audioUrl: null,
         convertStatus: 'idle',
         error: null,
+        progress: 0,
     });
 
     useEffect(() => {
-        // Get current tab URL
+        // Get current tab URL and check if it's already converted
         chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
             const url = tabs[0]?.url;
             if (!url) return;
@@ -72,17 +147,28 @@ export function Popup() {
     const handleConvert = async () => {
         if (!state.currentUrl) return;
 
-        setState(prev => ({ ...prev, convertStatus: 'converting' }));
+        setState(prev => ({
+            ...prev,
+            convertStatus: 'converting',
+            progress: 10,
+            error: null
+        }));
 
         try {
-            // Get article content from current tab
+            // Get current tab
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-            const response = await chrome.scripting.executeScript({
-                target: { tabId: tab.id! },
-                func: () => document.body.innerText,
-            });
 
-            const articleText = response[0].result;
+            // Extract article content
+            setState(prev => ({ ...prev, progress: 30 }));
+            const articleContent = await getArticleContent(tab);
+
+            // Show extraction success
+            setState(prev => ({ ...prev, progress: 50 }));
+            notifications.show({
+                title: 'Content extracted',
+                message: 'Converting to audio...',
+                color: 'blue',
+            });
 
             // Send to conversion API
             const convertResponse = await fetch('http://localhost:3000/api/convert', {
@@ -90,7 +176,9 @@ export function Popup() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     url: state.currentUrl,
-                    articleText,
+                    articleText: cleanHtml(typeof articleContent === 'string' ? articleContent : articleContent.content),
+                    title: typeof articleContent === 'string' ? '' : articleContent.title,
+                    author: typeof articleContent === 'string' ? '' : articleContent.author
                 }),
             });
 
@@ -98,18 +186,35 @@ export function Popup() {
                 throw new Error('Conversion failed');
             }
 
+            setState(prev => ({ ...prev, progress: 90 }));
+
             const data = await convertResponse.json();
             setState(prev => ({
                 ...prev,
                 audioUrl: data.audio_url,
                 convertStatus: 'done',
+                progress: 100,
             }));
+
+            notifications.show({
+                title: 'Success!',
+                message: 'Article converted to audio',
+                color: 'green',
+            });
         } catch (error) {
+            console.error('Conversion error:', error);
             setState(prev => ({
                 ...prev,
-                error: 'Failed to convert article',
+                error: 'Failed to convert article. Please try again.',
                 convertStatus: 'error',
+                progress: 0,
             }));
+
+            notifications.show({
+                title: 'Error',
+                message: 'Failed to convert article',
+                color: 'red',
+            });
         }
     };
 
@@ -150,9 +255,21 @@ export function Popup() {
                                 loading={state.convertStatus === 'converting'}
                                 onClick={handleConvert}
                                 disabled={state.convertStatus === 'converting'}
+                                leftSection={<IconArticle size={16} />}
                             >
                                 {state.convertStatus === 'converting' ? 'Converting...' : 'Convert to Audio'}
                             </Button>
+
+                            {state.convertStatus === 'converting' && (
+                                <Progress
+                                    value={state.progress}
+                                    size="sm"
+                                    color="brand"
+                                    animated
+                                    label={`${state.progress}%`}
+                                />
+                            )}
+
                             <Text size="sm" c="dimmed">
                                 Convert this article to audio for easy listening
                             </Text>
